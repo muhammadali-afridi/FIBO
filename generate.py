@@ -175,6 +175,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to a .pt2 from src/fibo_inference/test.py (skips torch.compile on the transformer).",
     )
+    parser.add_argument(
+        "--aot-transformer-extracted",
+        type=str,
+        default=None,
+        help="Path to a extracted directory from src/fibo_inference/aot_transformer.py (skips torch.compile on the transformer).",
+    )
     return parser
 
 
@@ -256,6 +262,7 @@ def main():
         num_steps=args.num_steps,
         guidance_scale=args.guidance_scale,
         aot_transformer_package=args.aot_transformer_package,
+        aot_transformer_extracted=args.aot_transformer_extracted,
     )
     elapsed = time.perf_counter() - start_time
 

@@ -103,7 +103,6 @@ class AOTFiboTransformerRunner(nn.Module):
                 f"got {0 if text_encoder_layers is None else len(text_encoder_layers)}"
             )
 
-        # The low-level AOTIModelContainerRunner requires a single list of inputs
         inputs = [
             hidden_states,
             encoder_hidden_states,
@@ -114,7 +113,6 @@ class AOTFiboTransformerRunner(nn.Module):
             *text_encoder_layers,
         ]
 
-        # Use the .run() method of the C++ runner
         outputs = self._compiled.run(inputs)
         sample = outputs[0]
 
@@ -123,62 +121,97 @@ class AOTFiboTransformerRunner(nn.Module):
         return (sample,)
 
 
-def attach_aot_transformer(pipeline: Any, package_path: str) -> None:
-    """Replace `pipeline.transformer` with an AOT-loaded runner, caching extraction to RAM."""
+# ---------------------------------------------------------------------------
+# Helpers: locate .so inside an extracted directory
+# ---------------------------------------------------------------------------
+
+def _find_so(directory: str) -> tuple[str, str]:
+    """Walk `directory` and return (so_path, cubin_dir)."""
+    for root, _dirs, files in os.walk(directory):
+        for f in files:
+            if f.endswith(".so"):
+                return os.path.join(root, f), root
+    raise FileNotFoundError(f"No .so found in {directory}")
+
+
+def _extract_pt2_to_cache(package_path: str) -> str:
+    """Extract .pt2 zip to /dev/shm cache, returning the extraction directory."""
     import time
-    
+
+    cache_dir = "/dev/shm/aoti_cache"
+    os.makedirs(cache_dir, exist_ok=True)
+
+    stat = os.stat(package_path)
+    file_id = f"{os.path.abspath(package_path)}_{stat.st_size}_{stat.st_mtime}"
+    file_hash = hashlib.md5(file_id.encode("utf-8")).hexdigest()[:12]
+
+    extract_dir = os.path.join(cache_dir, file_hash)
+    marker = os.path.join(extract_dir, ".done")
+
+    if not os.path.exists(marker):
+        print(f"Extracting {package_path} to RAM disk ...")
+        start = time.perf_counter()
+        with zipfile.ZipFile(package_path, "r") as zf:
+            zf.extractall(extract_dir)
+        open(marker, "w").close()
+        print(f"[Timing] Unzipping took {time.perf_counter() - start:.4f}s")
+    else:
+        print(f"[Timing] Found cached extraction at {extract_dir}, skipping unzip.")
+
+    return extract_dir
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def attach_aot_transformer(
+    pipeline: Any,
+    package_path: str | None = None,
+    extracted_dir: str | None = None,
+) -> None:
+    """Replace `pipeline.transformer` with an AOT-loaded runner.
+
+    Two modes:
+      1. **Pre-extracted directory** (fast — no unzipping):
+             attach_aot_transformer(pipe, extracted_dir="/data/aot_extracted")
+         Use this on fal / modal / any deploy where you upload the extracted
+         files to a persistent volume.
+
+      2. **Raw .pt2 file** (extracts to /dev/shm on first call):
+             attach_aot_transformer(pipe, package_path="model.pt2")
+         Convenience for local dev; 24s unzip on first run, cached after.
+    """
+    import time
+
+    if extracted_dir is None and package_path is None:
+        raise ValueError("Provide either extracted_dir or package_path")
+
     transformer = pipeline.transformer
     n = len(transformer.transformer_blocks) + len(transformer.single_transformer_blocks)
     device = next(transformer.parameters()).device
 
-    # 1. Setup RAM disk caching directory
-    cache_dir = "/dev/shm/aoti_cache"
-    os.makedirs(cache_dir, exist_ok=True)
-
-    # FAST HASHING: Hash the path, size, and mod time instead of the gigabytes of content
-    stat = os.stat(package_path)
-    file_id = f"{os.path.abspath(package_path)}_{stat.st_size}_{stat.st_mtime}"
-    file_hash = hashlib.md5(file_id.encode('utf-8')).hexdigest()[:12]
-    
-    extract_dir = os.path.join(cache_dir, file_hash)
-    marker = os.path.join(extract_dir, ".done")
-
-    # 2. Extract only if it hasn't been extracted yet
-    if not os.path.exists(marker):
-        print(f"Extracting {package_path} to RAM disk...")
-        start_unzip = time.perf_counter()
-        with zipfile.ZipFile(package_path, 'r') as zf:
-            zf.extractall(extract_dir)
-        open(marker, 'w').close()
-        print(f"[Timing] Unzipping took {time.perf_counter() - start_unzip:.4f} seconds")
+    # --- Resolve the directory containing the .so ---
+    if extracted_dir is not None:
+        # Fast path: already extracted on a volume, no unzipping
+        so_dir = extracted_dir
     else:
-        print(f"[Timing] Found cached extraction at {extract_dir}, skipping unzip.")
+        # Fallback: extract .pt2 to /dev/shm cache
+        so_dir = _extract_pt2_to_cache(package_path)
 
-    # 3. Locate the .so file and cubin directory
-    so_path, cubin_dir = None, None
-    for root, dirs, files in os.walk(extract_dir):
-        for f in files:
-            if f.endswith('.so'):
-                so_path = os.path.join(root, f)
-                cubin_dir = root  # Triton cubins are in the same dir as the .so
-                break
-        if so_path:
-            break
+    so_path, cubin_dir = _find_so(so_dir)
 
-    if not so_path:
-        raise FileNotFoundError("No .so found in pt2 archive")
-
-    # 4. Load the .so directly via the low-level runner, bypassing python metadata parsing
+    # --- Load the .so ---
     device_str = str(device)
-    print(f"Loading bare .so file via AOTIModelContainerRunner ({device_str})...")
+    print(f"Loading bare .so via AOTIModelContainerRunner ({device_str}) ...")
     start_load = time.perf_counter()
     if device.type == "cuda":
         compiled = torch._C._aoti.AOTIModelContainerRunnerCuda(so_path, 1, device_str, cubin_dir)
     else:
         compiled = torch._C._aoti.AOTIModelContainerRunnerCpu(so_path, 1, device_str, cubin_dir)
-    print(f"[Timing] .so loading took {time.perf_counter() - start_load:.4f} seconds")
+    print(f"[Timing] .so loading took {time.perf_counter() - start_load:.4f}s")
 
-    # 5. Attach runner to pipeline
+    # --- Attach runner to pipeline ---
     runner = AOTFiboTransformerRunner(compiled, n)
     runner.config = transformer.config
     runner.transformer_blocks = _BlocksLen(len(transformer.transformer_blocks))

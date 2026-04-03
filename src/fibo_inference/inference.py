@@ -125,6 +125,7 @@ def run(
     num_steps: int,
     guidance_scale: float,
     aot_transformer_package: Optional[str] = None,
+    aot_transformer_extracted: Optional[str] = None,
 ) -> Image.Image:
     assert torch.cuda.is_available()
 
@@ -133,11 +134,13 @@ def run(
         generator = torch.Generator(device="cuda").manual_seed(seed)
     if aot_transformer_package:
         pkg = Path(aot_transformer_package)
+    elif aot_transformer_extracted:
+        pkg = Path(aot_transformer_extracted)
         # if not pkg.is_file():
         #     raise SystemExit(f"AOT transformer package not found: {pkg}")
         print(f"Loading AOT transformer from {pkg}")
         start = time.perf_counter()
-        attach_aot_transformer(pipeline, str(pkg))
+        attach_aot_transformer(pipeline, package_path=str(pkg) if aot_transformer_package else None, extracted_dir=str(pkg) if aot_transformer_extracted else None)
         print("Time taken to load AOT models", time.perf_counter()-start)
     else:
         pass
