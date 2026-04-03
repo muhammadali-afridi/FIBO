@@ -1,10 +1,11 @@
 import json
 from pathlib import Path
 from typing import Any, Optional
-
+import time
 import torch
 from PIL import Image
 
+from src.fibo_inference.aot_transformer import attach_aot_transformer
 from src.fibo_inference.fibo_pipeline import BriaFiboPipeline
 from src.fibo_inference.prompt_to_json import (
     get_json_prompt,
@@ -123,13 +124,39 @@ def run(
     seed: int,
     num_steps: int,
     guidance_scale: float,
+    aot_transformer_package: Optional[str] = None,
+    aot_transformer_extracted: Optional[str] = None,
 ) -> Image.Image:
     assert torch.cuda.is_available()
 
     generator = None
     if seed >= 0:
         generator = torch.Generator(device="cuda").manual_seed(seed)
+    if aot_transformer_package:
+        pkg = Path(aot_transformer_package)
+    elif aot_transformer_extracted:
+        pkg = Path(aot_transformer_extracted)
+        # if not pkg.is_file():
+        #     raise SystemExit(f"AOT transformer package not found: {pkg}")
+        print(f"Loading AOT transformer from {pkg}")
+        start = time.perf_counter()
+        attach_aot_transformer(pipeline, package_path=str(pkg) if aot_transformer_package else None, extracted_dir=str(pkg) if aot_transformer_extracted else None)
+        print("Time taken to load AOT models", time.perf_counter()-start)
+    else:
+        pass
+        # print("JIT-compiling transformer (torch.compile, max-autotune)")
+        # pipeline.transformer = torch.compile(
+        #     pipeline.transformer,
+        #     mode="max-autotune",
+        #     fullgraph=True
+        # )
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch._inductor.config.max_autotune = True
+    torch._inductor.config.triton.cudagraphs = True
+    torch._dynamo.config.cache_size_limit = 128
 
+    start_inference=time.perf_counter()
     result = pipeline(
         prompt_payload,
         num_inference_steps=num_steps,
@@ -139,6 +166,6 @@ def run(
         height=height,
         guidance_scale=guidance_scale,
     )
-
+    print("Inference time", time.perf_counter()-start_inference)
     image = result.images[0]
     return image
